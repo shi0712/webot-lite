@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WeBot Lite</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .tab-active { border-bottom: 2px solid #3b82f6; color: #3b82f6; font-weight: 600; }
+    .slider-label { min-width: 3.5rem; text-align: right; }
+    input[type=range] { accent-color: #3b82f6; }
+    .toast {
+      position: fixed; bottom: 1.5rem; right: 1.5rem; z-index: 50;
+      padding: 0.75rem 1.25rem; border-radius: 0.5rem; color: #fff;
+      font-size: 0.875rem; transition: opacity 0.3s;
+    }
+    .toast-ok { background: #22c55e; }
+    .toast-err { background: #ef4444; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .status-dot.running { background: #22c55e; animation: pulse 1.5s infinite; }
+    .status-dot.stopped { background: #9ca3af; }
+    .status-dot.logged-in { background: #22c55e; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .toggle-switch { position: relative; width: 36px; height: 20px; }
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute; cursor: pointer; inset: 0;
+      background: #cbd5e1; border-radius: 20px; transition: 0.2s;
+    }
+    .toggle-slider::before {
+      content: ''; position: absolute; width: 16px; height: 16px;
+      left: 2px; bottom: 2px; background: #fff; border-radius: 50%; transition: 0.2s;
+    }
+    .toggle-switch input:checked + .toggle-slider { background: #3b82f6; }
+    .toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen text-gray-800">
+
+<!-- Toast -->
+<div id="toast" class="toast" style="opacity:0"></div>
+
+<!-- Header -->
+<header class="bg-white shadow-sm sticky top-0 z-40">
+  <div class="max-w-4xl mx-auto flex items-center justify-between px-4 py-3">
+    <h1 class="text-lg font-bold tracking-tight">Bot 配置面板</h1>
+    <div class="flex gap-1">
+      <button onclick="switchTab('wx')" id="tab-wx" class="px-4 py-1.5 text-sm rounded-t cursor-pointer hover:text-blue-500 tab-active">登录 & 运行</button>
+      <button onclick="switchTab('model')" id="tab-model" class="px-4 py-1.5 text-sm rounded-t cursor-pointer hover:text-blue-500">模型配置</button>
+      <button onclick="switchTab('tpl')" id="tab-tpl" class="px-4 py-1.5 text-sm rounded-t cursor-pointer hover:text-blue-500">对话模板</button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-4xl mx-auto px-4 py-6 space-y-6">
+
+  <!-- ==================== Tab 1: 登录 & 运行 ==================== -->
+  <section id="sec-wx">
+    <!-- Login status card -->
+    <div class="bg-white rounded-xl shadow p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold">微信登录状态</h2>
+        <div id="login-badge" class="flex items-center gap-2 text-sm text-gray-400">
+          <span class="status-dot stopped"></span> 检查中…
+        </div>
+      </div>
+
+      <!-- QR area (shown when not logged in) -->
+      <div id="qr-area" class="text-center space-y-4 hidden">
+        <div id="qr-img-box" class="w-56 h-56 mx-auto border rounded-lg flex items-center justify-center bg-gray-100 text-gray-400 text-sm">
+          点击下方按钮获取二维码
+        </div>
+        <p id="qr-status" class="text-sm text-gray-500">等待扫码…</p>
+        <div class="flex justify-center gap-3">
+          <button onclick="fetchQR()" class="px-5 py-2 bg-blue-500 text-white rounded-lg text-sm hover:bg-blue-600 transition">获取二维码</button>
+          <button onclick="stopPoll()" class="px-5 py-2 bg-gray-200 text-gray-600 rounded-lg text-sm hover:bg-gray-300 transition">停止轮询</button>
+        </div>
+      </div>
+
+      <!-- Logged-in area (shown when logged in) -->
+      <div id="logged-in-area" class="hidden">
+        <div class="flex items-center justify-center gap-2 text-green-600 text-sm py-2">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+          微信已登录
+        </div>
+        <p class="text-center text-xs text-gray-400 mb-3">如需切换账号，请点击下方重新扫码</p>
+        <div class="flex justify-center">
+          <button onclick="showQRArea()" class="px-4 py-1.5 text-xs text-gray-500 border rounded-lg hover:bg-gray-50 transition">重新扫码</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bot control card -->
+    <div class="bg-white rounded-xl shadow p-6 mt-4 space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold">Bot 运行控制</h2>
+        <div id="bot-badge" class="flex items-center gap-2 text-sm text-gray-400">
+          <span class="status-dot stopped"></span> 未运行
+        </div>
+      </div>
+
+      <div class="flex justify-center gap-3">
+        <button id="btn-start" onclick="startBot()" class="px-6 py-2 bg-green-500 text-white rounded-lg text-sm hover:bg-green-600 transition disabled:opacity-50 disabled:cursor-not-allowed">启动 Bot</button>
+        <button id="btn-stop" onclick="stopBot()" class="px-6 py-2 bg-red-500 text-white rounded-lg text-sm hover:bg-red-600 transition disabled:opacity-50 disabled:cursor-not-allowed" disabled>停止 Bot</button>
+      </div>
+
+      <!-- Stats -->
+      <div id="bot-stats" class="hidden text-center text-sm text-gray-500 space-y-1">
+        <div class="flex justify-center gap-6">
+          <span>收到: <strong id="stat-received">0</strong></span>
+          <span>回复: <strong id="stat-replied">0</strong></span>
+          <span>错误: <strong id="stat-errors">0</strong></span>
+        </div>
+        <div>运行时间: <strong id="stat-uptime">0s</strong></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== Tab 2: 模型配置 ==================== -->
+  <section id="sec-model" class="hidden space-y-5">
+    <div class="bg-white rounded-xl shadow p-6 space-y-5">
+      <h2 class="text-base font-semibold">模型 & Provider</h2>
+
+      <!-- Provider + Model -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">Provider</label>
+          <select id="sel-provider" onchange="onProviderChange()" class="w-full border rounded-lg px-3 py-2 text-sm"></select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">模型</label>
+          <select id="sel-model" onchange="onModelSelect()" class="w-full border rounded-lg px-3 py-2 text-sm"></select>
+          <input id="inp-model-custom" placeholder="或输入自定义模型名" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" oninput="cfg.model=this.value" />
+        </div>
+      </div>
+
+      <!-- API Key -->
+      <div>
+        <label class="block text-sm font-medium mb-1" id="lbl-key">API Key</label>
+        <input id="inp-key" type="password" class="w-full border rounded-lg px-3 py-2 text-sm" />
+      </div>
+
+      <!-- Base URL toggle -->
+      <div>
+        <div class="flex items-center gap-2 mb-1">
+          <label class="toggle-switch">
+            <input type="checkbox" id="chk-base" onchange="toggleBaseUrl()">
+            <span class="toggle-slider"></span>
+          </label>
+          <span class="text-sm text-gray-600">自定义 Base URL</span>
+        </div>
+        <input id="inp-base" class="w-full border rounded-lg px-3 py-2 text-sm hidden" placeholder="留空使用默认地址" />
+      </div>
+    </div>
+
+    <!-- Parameters -->
+    <div class="bg-white rounded-xl shadow p-6 space-y-4">
+      <h2 class="text-base font-semibold">生成参数</h2>
+      <div class="space-y-3" id="sliders-area"></div>
+    </div>
+
+    <!-- Web Search -->
+    <div class="bg-white rounded-xl shadow p-6 space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 class="text-base font-semibold">联网搜索</h2>
+        <label class="toggle-switch">
+          <input type="checkbox" id="chk-web-search" onchange="toggleWebSearch()">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <p class="text-xs text-gray-400">开启后，Bot 会在回复前搜索网络获取最新信息（使用 Bocha 搜索 API）</p>
+      <div id="web-search-config" class="hidden space-y-3">
+        <div>
+          <label class="block text-sm font-medium mb-1">Bocha API Key</label>
+          <input id="inp-bocha-key" type="password" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="在 open.bocha.cn 获取" />
+        </div>
+        <p class="text-xs text-gray-400">免费注册：<a href="https://open.bocha.cn" target="_blank" class="text-blue-500 underline">open.bocha.cn</a></p>
+      </div>
+    </div>
+
+    <div class="text-right">
+      <button onclick="saveConfig()" class="px-6 py-2 bg-green-500 text-white rounded-lg text-sm hover:bg-green-600 transition">保存配置</button>
+    </div>
+  </section>
+
+  <!-- ==================== Tab 3: 对话模板 ==================== -->
+  <section id="sec-tpl" class="hidden space-y-5">
+    <div class="bg-white rounded-xl shadow p-6 space-y-4">
+      <h2 class="text-base font-semibold">系统人设</h2>
+      <textarea id="inp-character-desc" rows="5" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="角色描述 (character_desc)"></textarea>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 space-y-4">
+      <h2 class="text-base font-semibold">私聊设置</h2>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          <label class="block text-sm font-medium mb-1">single_chat_prefix</label>
+          <input id="inp-single-chat-prefix" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="触发前缀（留空则所有消息都触发）" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">single_chat_reply_prefix</label>
+          <input id="inp-single-chat-reply-prefix" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="回复前缀" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium mb-1">single_chat_reply_suffix</label>
+          <input id="inp-single-chat-reply-suffix" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="回复后缀" />
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-white rounded-xl shadow p-6 space-y-4">
+      <h2 class="text-base font-semibold">其他</h2>
+      <div>
+        <label class="block text-sm font-medium mb-1">clear_memory_commands (JSON 数组)</label>
+        <input id="inp-clear-memory-commands" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder='["#清除记忆"]' />
+      </div>
+    </div>
+
+    <div class="text-right">
+      <button onclick="saveConfig()" class="px-6 py-2 bg-green-500 text-white rounded-lg text-sm hover:bg-green-600 transition">保存配置</button>
+    </div>
+  </section>
+
+</main>
+
+<script>
+// ========== State ==========
+let cfg = {};
+let providers = {};
+let currentQRCode = "";
+let polling = false;
+let botStatusTimer = null;
+
+// ========== Toast ==========
+function toast(msg, ok = true) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "toast " + (ok ? "toast-ok" : "toast-err");
+  el.style.opacity = "1";
+  setTimeout(() => { el.style.opacity = "0"; }, 2500);
+}
+
+// ========== Tabs ==========
+function switchTab(t) {
+  ["wx", "model", "tpl"].forEach(k => {
+    document.getElementById("sec-" + k).classList.toggle("hidden", k !== t);
+    document.getElementById("tab-" + k).classList.toggle("tab-active", k === t);
+  });
+}
+
+// ========== Sliders ==========
+const SLIDERS = [
+  { key: "temperature", min: 0, max: 2, step: 0.05, default: 0.7 },
+  { key: "top_p", min: 0, max: 1, step: 0.05, default: 1.0 },
+  { key: "frequency_penalty", min: -2, max: 2, step: 0.1, default: 0.0 },
+  { key: "presence_penalty", min: -2, max: 2, step: 0.1, default: 0.0 },
+  { key: "conversation_max_tokens", min: 256, max: 128000, step: 256, default: 2500 },
+];
+
+function buildSliders() {
+  const area = document.getElementById("sliders-area");
+  area.innerHTML = "";
+  SLIDERS.forEach(s => {
+    const val = cfg[s.key] ?? s.default;
+    const div = document.createElement("div");
+    div.className = "flex items-center gap-3";
+    div.innerHTML = `
+      <span class="text-sm w-48 shrink-0">${s.key}</span>
+      <input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${val}"
+             class="flex-1" id="slider-${s.key}"
+             oninput="cfg['${s.key}']=parseFloat(this.value);document.getElementById('val-${s.key}').textContent=this.value" />
+      <span class="slider-label text-sm font-mono" id="val-${s.key}">${val}</span>`;
+    area.appendChild(div);
+  });
+}
+
+// ========== Provider / Model ==========
+function populateProviders() {
+  const sel = document.getElementById("sel-provider");
+  sel.innerHTML = "";
+  for (const [k, v] of Object.entries(providers)) {
+    const opt = document.createElement("option");
+    opt.value = k;
+    opt.textContent = v.label;
+    sel.appendChild(opt);
+  }
+  // select provider from config, or detect from key_field
+  const savedProvider = cfg.provider;
+  if (savedProvider && providers[savedProvider]) {
+    sel.value = savedProvider;
+  } else {
+    for (const [k, v] of Object.entries(providers)) {
+      if (cfg[v.key_field]) { sel.value = k; break; }
+    }
+  }
+  onProviderChange();
+}
+
+function onProviderChange() {
+  const pk = document.getElementById("sel-provider").value;
+  const p = providers[pk];
+  if (!p) return;
+
+  // populate model dropdown
+  const selM = document.getElementById("sel-model");
+  selM.innerHTML = "";
+  p.models.forEach(m => {
+    const opt = document.createElement("option");
+    opt.value = m; opt.textContent = m;
+    selM.appendChild(opt);
+  });
+  const optC = document.createElement("option");
+  optC.value = "__custom__"; optC.textContent = "-- 自定义 --";
+  selM.appendChild(optC);
+
+  // select current model
+  if (cfg.model && p.models.includes(cfg.model)) {
+    selM.value = cfg.model;
+  } else {
+    selM.value = "__custom__";
+    document.getElementById("inp-model-custom").value = cfg.model || "";
+  }
+
+  // key label and value
+  document.getElementById("lbl-key").textContent = p.key_field;
+  document.getElementById("inp-key").value = cfg[p.key_field] || "";
+
+  // base url: show default or custom
+  const baseVal = cfg[p.base] || "";
+  const defaultBase = p.default_base || "";
+  const isCustom = baseVal && baseVal !== defaultBase;
+  document.getElementById("chk-base").checked = isCustom;
+  document.getElementById("inp-base").value = baseVal || defaultBase;
+  document.getElementById("inp-base").placeholder = defaultBase ? `默认: ${defaultBase}` : "留空使用默认地址";
+  toggleBaseUrl();
+}
+
+function toggleBaseUrl() {
+  const show = document.getElementById("chk-base").checked;
+  document.getElementById("inp-base").classList.toggle("hidden", !show);
+}
+
+function toggleWebSearch() {
+  const on = document.getElementById("chk-web-search").checked;
+  document.getElementById("web-search-config").classList.toggle("hidden", !on);
+}
+
+function onModelSelect() {
+  const v = document.getElementById("sel-model").value;
+  if (v !== "__custom__") {
+    cfg.model = v;
+    document.getElementById("inp-model-custom").value = "";
+  }
+}
+
+function collectModelTab() {
+  const pk = document.getElementById("sel-provider").value;
+  const p = providers[pk];
+  if (!p) return;
+
+  const selV = document.getElementById("sel-model").value;
+  if (selV !== "__custom__") cfg.model = selV;
+  else {
+    const custom = document.getElementById("inp-model-custom").value.trim();
+    if (custom) cfg.model = custom;
+  }
+
+  cfg.provider = pk;
+  cfg[p.key_field] = document.getElementById("inp-key").value.trim();
+
+  // base url: if toggle off, use default; if on, use input value
+  if (document.getElementById("chk-base").checked) {
+    cfg[p.base] = document.getElementById("inp-base").value.trim();
+  } else {
+    cfg[p.base] = p.default_base || "";
+  }
+
+  // bot_type is auto-set from provider
+  cfg.bot_type = p.bot_type || "chatGPT";
+
+  // web search
+  cfg.enable_web_search = document.getElementById("chk-web-search").checked;
+  cfg.bocha_api_key = document.getElementById("inp-bocha-key").value.trim();
+}
+
+// ========== Template Tab ==========
+const TPL_FIELDS = [
+  "character_desc",
+  "single_chat_prefix", "single_chat_reply_prefix", "single_chat_reply_suffix",
+  "clear_memory_commands",
+];
+
+function populateTemplates() {
+  TPL_FIELDS.forEach(k => {
+    const el = document.getElementById("inp-" + k.replace(/_/g, "-"));
+    if (el) el.value = cfg[k] ?? "";
+  });
+}
+
+function collectTemplates() {
+  TPL_FIELDS.forEach(k => {
+    const el = document.getElementById("inp-" + k.replace(/_/g, "-"));
+    if (el) cfg[k] = el.value;
+  });
+}
+
+// ========== Config Save / Load ==========
+async function loadConfig() {
+  try {
+    const [cRes, pRes] = await Promise.all([
+      fetch("/api/config"),
+      fetch("/api/providers"),
+    ]);
+    cfg = await cRes.json();
+    providers = await pRes.json();
+    populateProviders();
+    buildSliders();
+    populateTemplates();
+    // web search state
+    const wsOn = !!cfg.enable_web_search;
+    document.getElementById("chk-web-search").checked = wsOn;
+    document.getElementById("web-search-config").classList.toggle("hidden", !wsOn);
+    document.getElementById("inp-bocha-key").value = cfg.bocha_api_key || "";
+  } catch (e) {
+    toast("加载配置失败: " + e.message, false);
+  }
+}
+
+async function saveConfig() {
+  collectModelTab();
+  collectTemplates();
+  try {
+    const res = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    });
+    const data = await res.json();
+    if (data.ok) toast("配置已保存");
+    else toast("保存失败", false);
+  } catch (e) {
+    toast("保存失败: " + e.message, false);
+  }
+}
+
+// ========== WeChat Login Status ==========
+async function checkWeixinStatus() {
+  try {
+    const res = await fetch("/api/weixin/status");
+    const data = await res.json();
+    updateLoginUI(data.logged_in);
+  } catch (e) {
+    updateLoginUI(false);
+  }
+}
+
+function updateLoginUI(loggedIn) {
+  const badge = document.getElementById("login-badge");
+  const qrArea = document.getElementById("qr-area");
+  const loggedArea = document.getElementById("logged-in-area");
+
+  if (loggedIn) {
+    badge.innerHTML = '<span class="status-dot logged-in"></span> 已登录';
+    badge.className = "flex items-center gap-2 text-sm text-green-600";
+    qrArea.classList.add("hidden");
+    loggedArea.classList.remove("hidden");
+  } else {
+    badge.innerHTML = '<span class="status-dot stopped"></span> 未登录';
+    badge.className = "flex items-center gap-2 text-sm text-gray-400";
+    qrArea.classList.remove("hidden");
+    loggedArea.classList.add("hidden");
+  }
+}
+
+function showQRArea() {
+  document.getElementById("qr-area").classList.remove("hidden");
+  document.getElementById("logged-in-area").classList.add("hidden");
+}
+
+// ========== WeChat QR ==========
+async function fetchQR() {
+  stopPoll();
+  document.getElementById("qr-img-box").innerHTML = '<span class="text-gray-400 text-sm">加载中…</span>';
+  document.getElementById("qr-status").textContent = "正在获取二维码…";
+  try {
+    const res = await fetch("/api/weixin/qr");
+    const data = await res.json();
+    if (!data.ok) {
+      document.getElementById("qr-img-box").innerHTML = `<span class="text-red-500 text-sm">${data.error}</span>`;
+      document.getElementById("qr-status").textContent = "获取失败";
+      return;
+    }
+    currentQRCode = data.qrcode;
+    document.getElementById("qr-img-box").innerHTML = `<img src="${data.image}" class="w-full h-full object-contain" />`;
+    document.getElementById("qr-status").textContent = "请使用微信扫码…";
+    startPoll();
+  } catch (e) {
+    document.getElementById("qr-img-box").innerHTML = `<span class="text-red-500 text-sm">${e.message}</span>`;
+  }
+}
+
+function startPoll() {
+  if (polling) return;
+  polling = true;
+  doPoll();
+}
+
+async function doPoll() {
+  if (!polling) return;
+  try {
+    const res = await fetch("/api/weixin/qr/poll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ qrcode: currentQRCode }),
+    });
+    const data = await res.json();
+    const status = data.status || (data.data && data.data.status) || "unknown";
+    const statusText = {
+      wait: "等待扫码…",
+      scaned: "已扫码，请在手机上确认…",
+      confirmed: "登录成功!",
+      expired: "二维码已过期，请重新获取",
+    }[status] || `状态: ${status}`;
+    document.getElementById("qr-status").textContent = statusText;
+    if (status === "confirmed") {
+      polling = false;
+      toast("微信登录成功!");
+      updateLoginUI(true);
+      return;
+    }
+    if (status === "expired") { polling = false; return; }
+    if (polling) setTimeout(doPoll, 500);
+  } catch (e) {
+    if (polling) setTimeout(doPoll, 2000);
+  }
+}
+
+function stopPoll() { polling = false; }
+
+// ========== Bot Control ==========
+async function startBot() {
+  document.getElementById("btn-start").disabled = true;
+  try {
+    const res = await fetch("/api/bot/start", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      toast(data.message);
+      updateBotUI(true);
+      startBotStatusPolling();
+    } else {
+      toast(data.error || "启动失败", false);
+      document.getElementById("btn-start").disabled = false;
+    }
+  } catch (e) {
+    toast("启动失败: " + e.message, false);
+    document.getElementById("btn-start").disabled = false;
+  }
+}
+
+async function stopBot() {
+  document.getElementById("btn-stop").disabled = true;
+  try {
+    const res = await fetch("/api/bot/stop", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      toast(data.message);
+      updateBotUI(false);
+      stopBotStatusPolling();
+    } else {
+      toast(data.error || "停止失败", false);
+    }
+  } catch (e) {
+    toast("停止失败: " + e.message, false);
+  }
+  document.getElementById("btn-stop").disabled = false;
+}
+
+function updateBotUI(running) {
+  const badge = document.getElementById("bot-badge");
+  const stats = document.getElementById("bot-stats");
+  const btnStart = document.getElementById("btn-start");
+  const btnStop = document.getElementById("btn-stop");
+
+  if (running) {
+    badge.innerHTML = '<span class="status-dot running"></span> 运行中';
+    badge.className = "flex items-center gap-2 text-sm text-green-600";
+    stats.classList.remove("hidden");
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+  } else {
+    badge.innerHTML = '<span class="status-dot stopped"></span> 未运行';
+    badge.className = "flex items-center gap-2 text-sm text-gray-400";
+    stats.classList.add("hidden");
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+  }
+}
+
+function formatUptime(seconds) {
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h + "h " + m + "m";
+}
+
+async function pollBotStatus() {
+  try {
+    const res = await fetch("/api/bot/status");
+    const data = await res.json();
+    if (data.running) {
+      updateBotUI(true);
+      const s = data.stats || {};
+      document.getElementById("stat-received").textContent = s.received || 0;
+      document.getElementById("stat-replied").textContent = s.replied || 0;
+      document.getElementById("stat-errors").textContent = s.errors || 0;
+      document.getElementById("stat-uptime").textContent = formatUptime(s.uptime_seconds || 0);
+    } else {
+      updateBotUI(false);
+      stopBotStatusPolling();
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function startBotStatusPolling() {
+  stopBotStatusPolling();
+  botStatusTimer = setInterval(pollBotStatus, 3000);
+}
+
+function stopBotStatusPolling() {
+  if (botStatusTimer) { clearInterval(botStatusTimer); botStatusTimer = null; }
+}
+
+// ========== Init ==========
+async function init() {
+  await loadConfig();
+  await checkWeixinStatus();
+  // check if bot is already running
+  try {
+    const res = await fetch("/api/bot/status");
+    const data = await res.json();
+    if (data.running) {
+      updateBotUI(true);
+      startBotStatusPolling();
+    }
+  } catch (e) { /* ignore */ }
+}
+init();
+</script>
+</body>
+</html>
