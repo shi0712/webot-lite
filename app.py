@@ -187,6 +187,8 @@ def ilink_getupdates(base_url, token, buf=""):
 
 
 def ilink_sendtext(base_url, token, to_user, text, context_token):
+    logger.info("[Send] to=%s len=%d: %s", to_user, len(text),
+                (text[:80] + "...") if len(text) > 80 else text)
     return ilink_post(base_url, "ilink/bot/sendmessage", token, {
         "msg": {
             "from_user_id": "",
@@ -247,10 +249,12 @@ def _download_image_as_base64(image_item):
     encrypt_param = media.get("encrypt_query_param", "")
     aes_key_str = image_item.get("aeskey", "") or media.get("aes_key", "")
     if not encrypt_param or not aes_key_str:
-        logger.warning("Image missing CDN params")
+        logger.warning("[Image] Missing CDN params, skipping download")
         return None
     try:
         url = f"{CDN_BASE_URL}/download?encrypted_query_param={quote(encrypt_param)}"
+        logger.info("[Image] Downloading from CDN...")
+        t0 = time.time()
         resp = http_requests.get(url, timeout=30)
         resp.raise_for_status()
         key = _parse_aes_key(aes_key_str)
@@ -267,9 +271,11 @@ def _download_image_as_base64(image_item):
             mime = "image/webp"
         else:
             mime = "image/jpeg"  # fallback
+        elapsed = time.time() - t0
+        logger.info("[Image] Downloaded %.1fKB %s in %.1fs", len(decrypted) / 1024, mime, elapsed)
         return mime, b64
     except Exception as e:
-        logger.error("Image download/decrypt failed: %s", e)
+        logger.error("[Image] Download/decrypt failed: %s", e)
         return None
 
 
@@ -280,6 +286,8 @@ def _download_image_as_base64(image_item):
 def web_search(query, api_key, count=5):
     """Search the web via Bocha API, return formatted context string."""
     try:
+        logger.info("[Search] Bocha query='%s' count=%d", query[:60], count)
+        t0 = time.time()
         resp = http_requests.post("https://api.bocha.cn/v1/web-search", json={
             "query": query,
             "count": count,
@@ -289,12 +297,14 @@ def web_search(query, api_key, count=5):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }, timeout=15)
+        elapsed = time.time() - t0
         if resp.status_code != 200:
-            logger.warning("Bocha search HTTP %s", resp.status_code)
+            logger.warning("[Search] Bocha HTTP %s in %.1fs", resp.status_code, elapsed)
             return ""
         data = resp.json()
         pages = data.get("data", {}).get("webPages", {}).get("value", [])
         if not pages:
+            logger.info("[Search] Bocha returned 0 results in %.1fs", elapsed)
             return ""
         parts = []
         for i, p in enumerate(pages[:count], 1):
@@ -302,6 +312,7 @@ def web_search(query, api_key, count=5):
             snippet = p.get("summary") or p.get("snippet", "")
             url = p.get("url", "")
             parts.append(f"[{i}] {title}\n{snippet}\n{url}")
+        logger.info("[Search] Bocha returned %d results in %.1fs", len(parts), elapsed)
         return "\n\n".join(parts)
     except Exception as e:
         logger.error("Web search failed: %s", e)
@@ -349,16 +360,42 @@ def _resolve_provider(cfg):
     return provider_key, p
 
 
-def call_ai(user_text, user_id, cfg, image_b64=None):
-    """Call AI provider and return reply text. image_b64=(mime, b64str) for vision."""
+import re
+
+# patterns that suggest the user needs real-time / web information
+_SEARCH_PATTERNS = re.compile(
+    r"搜索|搜一下|查一下|查查|帮我查|帮我搜|百度|谷歌|google"
+    r"|最新|最近|今天|昨天|今年|明天|这周|本周|上周|这个月|本月"
+    r"|新闻|热点|热搜|头条"
+    r"|现在|目前|当前|当下|实时|最新版"
+    r"|价格|股价|汇率|天气|比分|赛果|票房|排行|榜单"
+    r"|怎么了|发生了什么|出了什么事"
+    r"|是谁|是什么时候|哪一年"
+    r"|how much|latest|news|price|weather|today|current|recent",
+    re.IGNORECASE,
+)
+
+
+def _needs_web_search(text):
+    """Quick heuristic: does this question likely need real-time web info?"""
+    return bool(_SEARCH_PATTERNS.search(text))
+
+
+def call_ai(user_text, user_id, cfg, images=None):
+    """Call AI provider and return reply text. images=[(mime,b64str),...] for vision."""
     provider_key, p = _resolve_provider(cfg)
     api_key = cfg.get(p["key_field"], "")
     base_url = cfg.get(p["base"], "") or p.get("default_base", "")
     model = cfg.get("model", "gpt-4o")
     system_prompt = cfg.get("character_desc", "你是一个有用的助手。")
     temperature = cfg.get("temperature", 0.7)
+    img_count = len(images) if images else 0
+
+    logger.info("[AI] user=%s provider=%s model=%s images=%d text=%s",
+                user_id, provider_key, model, img_count, (user_text[:60] + "...") if len(user_text) > 60 else user_text)
 
     if not api_key:
+        logger.warning("[AI] No API key for provider=%s", provider_key)
         return "[错误] 未配置 API Key，请在配置面板中设置"
 
     # check clear memory commands
@@ -369,59 +406,85 @@ def call_ai(user_text, user_id, cfg, image_b64=None):
         cmds = []
     if user_text.strip() in cmds:
         _clear_history(user_id)
+        logger.info("[AI] Memory cleared for user=%s", user_id)
         return "记忆已清除"
 
     # build messages
     history = _get_history(user_id)
+    logger.debug("[AI] History turns=%d for user=%s", len(history) // 2, user_id)
 
-    # web search augmentation
+    # web search augmentation — only search when the question likely needs real-time info
     search_context = ""
-    if cfg.get("enable_web_search") and cfg.get("bocha_api_key") and user_text and not image_b64:
-        search_context = web_search(user_text, cfg["bocha_api_key"])
+    if cfg.get("enable_web_search") and cfg.get("bocha_api_key") and user_text and not images:
+        if _needs_web_search(user_text):
+            logger.info("[Search] Triggered for: %s", user_text[:60])
+            search_context = web_search(user_text, cfg["bocha_api_key"])
+            if search_context:
+                logger.info("[Search] Got %d results", search_context.count("["))
+            else:
+                logger.info("[Search] No results")
+        else:
+            logger.debug("[Search] Skipped (no real-time keywords): %s", user_text[:40])
     if search_context:
         system_prompt += (
             "\n\n以下是与用户问题相关的网络搜索结果，请参考这些信息回答，"
             "如果搜索结果与问题无关可忽略：\n\n" + search_context
         )
 
-    # build user content (text-only or vision)
-    if image_b64:
-        mime, b64str = image_b64
+    # build user content (text-only or vision with multiple images)
+    if images:
         if provider_key == "claude":
             user_content = []
             if user_text:
                 user_content.append({"type": "text", "text": user_text})
-            user_content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime, "data": b64str},
-            })
+            for mime, b64str in images:
+                user_content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": mime, "data": b64str},
+                })
         else:
             # OpenAI-compatible vision format
             user_content = []
             if user_text:
                 user_content.append({"type": "text", "text": user_text})
-            user_content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64str}"},
-            })
+            for mime, b64str in images:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64str}"},
+                })
     else:
         user_content = user_text
 
     messages = [{"role": "system", "content": system_prompt}] + history + [{"role": "user", "content": user_content}]
+    msg_count = len(messages)
 
+    t0 = time.time()
     try:
         if provider_key == "claude":
+            logger.info("[AI] Calling Claude model=%s msgs=%d", model, msg_count)
             reply = _call_claude(api_key, base_url, model, messages, temperature)
         elif provider_key == "gemini" and "googleapis.com" in base_url:
-            reply = _call_gemini_native(api_key, base_url, model, messages, temperature, image_b64)
+            logger.info("[AI] Calling Gemini native model=%s msgs=%d", model, msg_count)
+            reply = _call_gemini_native(api_key, base_url, model, messages, temperature, images)
         else:
+            logger.info("[AI] Calling OpenAI-compatible model=%s base=%s msgs=%d", model, base_url, msg_count)
             reply = _call_openai_compatible(api_key, base_url, model, messages, temperature)
     except Exception as e:
-        logger.error("AI call failed: %s", e)
+        logger.error("[AI] Call failed after %.1fs: %s", time.time() - t0, e)
         return f"[AI 调用失败] {e}"
 
+    elapsed = time.time() - t0
+    logger.info("[AI] Reply in %.1fs (%d chars): %s", elapsed, len(reply),
+                (reply[:80] + "...") if len(reply) > 80 else reply)
+
     # store conversation (text-only summary for history)
-    history_user = user_text if user_text else "[图片]"
+    img_count = len(images) if images else 0
+    if img_count and user_text:
+        history_user = f"[{img_count}张图片] {user_text}"
+    elif img_count:
+        history_user = f"[{img_count}张图片]"
+    else:
+        history_user = user_text
     _append_history(user_id, "user", history_user)
     _append_history(user_id, "assistant", reply)
     return reply
@@ -474,7 +537,7 @@ def _call_claude(api_key, base_url, model, messages, temperature):
     return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
 
-def _call_gemini_native(api_key, base_url, model, messages, temperature, image_b64=None):
+def _call_gemini_native(api_key, base_url, model, messages, temperature, images=None):
     """Call Gemini via its native generateContent API."""
     url = f"{base_url.rstrip('/')}/v1beta/models/{model}:generateContent?key={api_key}"
 
@@ -490,22 +553,22 @@ def _call_gemini_native(api_key, base_url, model, messages, temperature, image_b
         if isinstance(content, str):
             contents.append({"role": role, "parts": [{"text": content}]})
         elif isinstance(content, list):
-            # vision content from call_ai — rebuild for Gemini format
+            # convert OpenAI/Claude vision blocks to Gemini format
             parts = []
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append({"text": block["text"]})
-            # image handled separately below
-            if parts:
-                contents.append({"role": role, "parts": parts})
-
-    # if there's an image, add it to the last user message
-    if image_b64:
-        mime, b64str = image_b64
-        if contents and contents[-1]["role"] == "user":
-            contents[-1]["parts"].append({
-                "inline_data": {"mime_type": mime, "data": b64str}
-            })
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append({"text": block["text"]})
+                    elif block.get("type") == "image_url":
+                        # OpenAI data URI → Gemini inline_data
+                        data_url = block.get("image_url", {}).get("url", "")
+                        if data_url.startswith("data:"):
+                            header, b64data = data_url.split(",", 1)
+                            mime_type = header.split(":")[1].split(";")[0]
+                            parts.append({"inline_data": {"mime_type": mime_type, "data": b64data}})
+            if not parts:
+                parts.append({"text": ""})
+            contents.append({"role": role, "parts": parts})
 
     body = {
         "contents": contents,
@@ -537,6 +600,12 @@ class BotEngine:
         self._running = False
         self._stop_event = threading.Event()
         self.stats = {"received": 0, "replied": 0, "errors": 0, "started_at": None}
+        # per-user image buffer: { user_id: {"images": [(mime,b64),...], "context_token": str, "ts": float} }
+        self._image_buf = {}
+        self._image_buf_lock = threading.Lock()
+
+    # image buffer timeout (seconds) — if no text follows within this time, flush with default prompt
+    IMAGE_BUF_TIMEOUT = 60
 
     @property
     def running(self):
@@ -558,6 +627,49 @@ class BotEngine:
         self._running = False
         self._stop_event.set()
         return True
+
+    def _buf_add_image(self, user_id, img_data, context_token):
+        """Add an image to the user's buffer."""
+        with self._image_buf_lock:
+            if user_id not in self._image_buf:
+                self._image_buf[user_id] = {"images": [], "context_token": context_token, "ts": time.time()}
+            self._image_buf[user_id]["images"].append(img_data)
+            self._image_buf[user_id]["context_token"] = context_token
+            self._image_buf[user_id]["ts"] = time.time()
+
+    def _buf_pop(self, user_id):
+        """Pop and return buffered images for user, or None."""
+        with self._image_buf_lock:
+            return self._image_buf.pop(user_id, None)
+
+    def _buf_check_timeouts(self, base_url, token):
+        """Flush image buffers that have timed out (no text followed)."""
+        now = time.time()
+        expired = []
+        with self._image_buf_lock:
+            for uid, buf in self._image_buf.items():
+                if now - buf["ts"] > self.IMAGE_BUF_TIMEOUT:
+                    expired.append(uid)
+        for uid in expired:
+            buf = self._buf_pop(uid)
+            if buf and buf["images"]:
+                logger.info("Image buffer timeout for %s, flushing %d image(s)", uid, len(buf["images"]))
+                self._reply_with_images(uid, buf["images"], "请描述这些图片" if len(buf["images"]) > 1 else "请描述这张图片",
+                                        buf["context_token"], base_url, token)
+
+    def _reply_with_images(self, user_id, images, text, context_token, base_url, token):
+        """Call AI with text + multiple images, send reply."""
+        cfg = load_config()
+        prefix = cfg.get("single_chat_reply_prefix", "")
+        suffix = cfg.get("single_chat_reply_suffix", "")
+        try:
+            reply = call_ai(text, user_id, cfg, images=images)
+            full_reply = f"{prefix}{reply}{suffix}"
+            ilink_sendtext(base_url, token, user_id, full_reply, context_token)
+            self.stats["replied"] += 1
+        except Exception as e:
+            logger.error("Reply failed for %s: %s", user_id, e)
+            self.stats["errors"] += 1
 
     def _loop(self):
         logger.info("Bot engine started")
@@ -590,12 +702,22 @@ class BotEngine:
 
                 buf = data.get("get_updates_buf", buf)
                 msgs = data.get("msgs", [])
+                if msgs:
+                    logger.info("[Poll] Received %d message(s)", len(msgs))
 
                 for msg in msgs:
                     self._handle_message(msg, base_url, token)
 
+                # flush timed-out image buffers
+                self._buf_check_timeouts(base_url, token)
+
+            except (http_requests.exceptions.ConnectionError,
+                    http_requests.exceptions.Timeout) as e:
+                # connection reset / timeout is normal for long-polling, just reconnect
+                logger.debug("[Poll] Connection interrupted, reconnecting: %s", type(e).__name__)
+                continue
             except Exception as e:
-                logger.error("getupdates error: %s", e)
+                logger.error("[Poll] Unexpected error: %s", e)
                 self.stats["errors"] += 1
                 # avoid tight error loop
                 if not self._stop_event.wait(3):
@@ -615,7 +737,7 @@ class BotEngine:
 
         # parse item_list: extract text, image, voice, file/video
         text = ""
-        image_item = None
+        image_items = []
         has_file = False
         has_video = False
 
@@ -624,9 +746,8 @@ class BotEngine:
             if itype == ITEM_TEXT:
                 text = item.get("text_item", {}).get("text", "")
             elif itype == ITEM_IMAGE:
-                image_item = item.get("image_item", {})
+                image_items.append(item.get("image_item", {}))
             elif itype == ITEM_VOICE:
-                # use voice transcription text if available
                 voice_text = item.get("voice_item", {}).get("text", "")
                 if voice_text:
                     text = voice_text
@@ -640,37 +761,42 @@ class BotEngine:
         suffix = cfg.get("single_chat_reply_suffix", "")
 
         try:
-            # case 1: image (with optional text caption)
-            if image_item:
-                logger.info("Received image from %s (text=%s)", user_id, text[:30] if text else "")
-                img_data = _download_image_as_base64(image_item)
+            # download images from this message
+            new_images = []
+            for img_item in image_items:
+                img_data = _download_image_as_base64(img_item)
                 if img_data:
-                    prompt = text or "请描述这张图片"
-                    reply = call_ai(prompt, user_id, cfg, image_b64=img_data)
-                else:
-                    reply = call_ai(text or "[用户发送了一张图片，但下载失败]", user_id, cfg)
-                full_reply = f"{prefix}{reply}{suffix}"
-                ilink_sendtext(base_url, token, user_id, full_reply, context_token)
-                self.stats["replied"] += 1
+                    new_images.append(img_data)
+
+            # case 1: image(s) without text — buffer them, wait for text
+            if new_images and not text:
+                for img in new_images:
+                    self._buf_add_image(user_id, img, context_token)
+                logger.info("Buffered %d image(s) from %s (total buffered: checking)", len(new_images), user_id)
                 return
 
-            # case 2: text or voice transcription
+            # case 2: text arrived — check if there are buffered images to include
             if text:
-                logger.info("Received from %s: %s", user_id, text[:50])
-                reply = call_ai(text, user_id, cfg)
-                full_reply = f"{prefix}{reply}{suffix}"
-                ilink_sendtext(base_url, token, user_id, full_reply, context_token)
-                self.stats["replied"] += 1
+                buffered = self._buf_pop(user_id)
+                all_images = (buffered["images"] if buffered else []) + new_images
+
+                if all_images:
+                    logger.info("Received text from %s with %d image(s)", user_id, len(all_images))
+                    self._reply_with_images(user_id, all_images, text, context_token, base_url, token)
+                else:
+                    logger.info("Received from %s: %s", user_id, text[:50])
+                    reply = call_ai(text, user_id, cfg)
+                    full_reply = f"{prefix}{reply}{suffix}"
+                    ilink_sendtext(base_url, token, user_id, full_reply, context_token)
+                    self.stats["replied"] += 1
                 return
 
-            # case 3: file or video without text → unsupported hint
+            # case 3: file or video without text
             if has_file or has_video:
-                hint = "暂不支持文件/视频消息，请发送文字或图片 🙂"
+                hint = "暂不支持文件/视频消息，请发送文字或图片"
                 ilink_sendtext(base_url, token, user_id, hint, context_token)
                 self.stats["replied"] += 1
                 return
-
-            # no recognizable content, ignore
 
         except Exception as e:
             logger.error("Reply failed for %s: %s", user_id, e)
